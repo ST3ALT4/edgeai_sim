@@ -1,3 +1,14 @@
-opencv-python 
-mediapipe 
-numpy
+# ─────────────────────────────────────────────────────────────────────
+#  requirements.txt — Particle Simulator
+#
+#  Jetson Nano (aarch64 / JetPack 4.6):
+#    mediapipe 0.9.3 is the last version with an official aarch64 wheel
+#    that also includes the stable mp.solutions.hands API.
+#    The new Tasks API (mediapipe >= 0.10) has no aarch64 wheel — avoid it.
+#
+#  Desktop (x86-64):
+#    Any version from 0.9.x onwards works fine; remove the pin if needed.
+# ─────────────────────────────────────────────────────────────────────
+numpy>=1.21,<2.0
+mediapipe==0.9.3
+opencv-python>=4.5

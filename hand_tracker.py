@@ -1,51 +1,141 @@
+# ─────────────────────────────────────────
+#  hand_tracker.py  —  MediaPipe wrapper
+#
+#  JETSON NANO FIX:
+#  Uses the classic mp.solutions.hands API (mediapipe <= 0.9.x)
+#  instead of the new Tasks API (mediapipe >= 0.10.x) which has
+#  no pre-built aarch64 wheel for Jetson Nano / JetPack 4.6.
+#
+#  Output dict format is identical to the original so main.py
+#  and particle_system.py are unchanged.
+# ─────────────────────────────────────────
+
 import cv2
-import numpy as np
-import onnxruntime as ort
+import mediapipe as mp
 import math
 from config import PINCH_THRESHOLD, WIDTH, HEIGHT
 
+
+# ── Drawing helper ────────────────────────────────────────────────────────────
+CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+]
+
+
+def _draw_landmarks(frame, landmarks_px):
+    for x, y in landmarks_px:
+        cv2.circle(frame, (x, y), 4, (0, 255, 0), -1)
+    for a, b in CONNECTIONS:
+        cv2.line(frame, landmarks_px[a], landmarks_px[b], (0, 200, 100), 1)
+
+
+# ── HandTracker ───────────────────────────────────────────────────────────────
 class HandTracker:
     def __init__(self):
-        # Use an ONNX version of the hand landmarker model
-        # You will need to download 'hand_landmark.onnx' to your project folder
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        self.session = ort.InferenceSession("hand_landmark.onnx", providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
+        mp_hands = mp.solutions.hands
+        # classic Hands solution — works on mediapipe 0.8.x / 0.9.x (aarch64 wheel)
+        self._hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            model_complexity=0,            # 0 = lite model, faster on Nano
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.5,
+        )
+        print("[INFO] MediaPipe Hands (Solutions API) initialised.")
 
+    # ── Main process call ─────────────────────────────────────────────────
     def process(self, frame):
+        """
+        Returns { 'left': HandData | None, 'right': HandData | None }
+        Same dict format as the original Tasks-API version.
+        """
         h, w = frame.shape[:2]
-        img = cv2.resize(frame, (224, 224))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))[np.newaxis, :]
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        outputs = self.session.run(None, {self.input_name: img})
-    
-        # Reshape the flat 63-value array into (21, 3) 
-        # to get [x, y, z] for each of the 21 points
-        landmarks = outputs[0].flatten().reshape(21, 3) 
-    
-        data = self._extract(landmarks, w, h)
-        return {"left": None, "right": data}
+        # Mark read-only for internal MediaPipe optimisation
+        rgb_frame.flags.writeable = False
+        result = self._hands.process(rgb_frame)
+        rgb_frame.flags.writeable = True
 
-    def _extract(self, landmarks, w, h):
-        # landmarks is now (21, 3), so lm[0] and lm[1] will work
-        pts = [(lm[0], lm[1]) for lm in landmarks]
-        px_coords = [(int(x * w), int(y * h)) for x, y in pts]
-    
-        # Calculate palm center using the first 5 landmarks (wrist and MCPs)
-        palm_x = sum(p[0] for p in pts[:5]) / 5
-        palm_y = sum(p[1] for p in pts[:5]) / 5
-    
+        left_data  = None
+        right_data = None
+
+        if result.multi_hand_landmarks is None:
+            return {"left": None, "right": None}
+
+        for lm_proto, handedness_proto in zip(
+            result.multi_hand_landmarks,
+            result.multi_handedness,
+        ):
+            # MediaPipe labels are MIRRORED for selfie view — flip them
+            raw_label = handedness_proto.classification[0].label  # "Left" / "Right"
+            label = "Right" if raw_label == "Left" else "Left"
+
+            # Pixel coords for drawing
+            landmarks_px = [
+                (int(lm.x * w), int(lm.y * h)) for lm in lm_proto.landmark
+            ]
+            _draw_landmarks(frame, landmarks_px)
+
+            data = self._extract(lm_proto.landmark, w, h, landmarks_px)
+
+            if label == "Left":
+                left_data = data
+            else:
+                right_data = data
+
+        return {"left": left_data, "right": right_data}
+
+    # ── Feature extraction ────────────────────────────────────────────────
+    def _extract(self, lm_list, w, h, landmarks_px):
+        pts = [(lm.x, lm.y) for lm in lm_list]   # normalised 0-1
+
+        # Palm centre = average of wrist + MCP joints
+        palm_x = sum(pts[i][0] for i in [0, 1, 5, 9, 13, 17]) / 6
+        palm_y = sum(pts[i][1] for i in [0, 1, 5, 9, 13, 17]) / 6
+
+        fingers_up   = self._count_fingers(pts)
+        finger_count = sum(fingers_up)
+
+        pinch_dist = math.dist(pts[4], pts[8])
+        is_pinched = pinch_dist < PINCH_THRESHOLD
+
+        # Wrist tilt angle
+        wrist   = pts[0]
+        mid_mcp = pts[9]
+        angle_rad = math.atan2(
+            mid_mcp[1] - wrist[1],
+            mid_mcp[0] - wrist[0],
+        )
+        tilt_deg = math.degrees(angle_rad)
+
+        fingertips_px = [landmarks_px[i] for i in [4, 8, 12, 16, 20]]
+
         return {
-            "palm_norm": (palm_x, palm_y),
-            "palm_px": (int(palm_x * w), int(palm_y * h)),
-            "finger_count": self._count_fingers(pts),
-            "is_pinched": math.dist(pts[4], pts[8]) < PINCH_THRESHOLD,
-            "index_tip_px": px_coords[8],
+            "palm_norm":     (palm_x, palm_y),
+            "palm_px":       (int(palm_x * w), int(palm_y * h)),
+            "finger_count":  finger_count,
+            "fingers_up":    fingers_up,
+            "is_pinched":    is_pinched,
+            "pinch_dist":    pinch_dist,
+            "tilt_deg":      tilt_deg,
+            "fingertips_px": fingertips_px,
+            "index_tip_px":  fingertips_px[1],
         }
+
     def _count_fingers(self, pts):
-        # Simplified logic: tip Y < pip Y
-        count = 0
-        if pts[8][1] < pts[6][1]: count += 1 # Index
-        if pts[12][1] < pts[10][1]: count += 1 # Middle
-        return count
+        fingers = []
+        # Thumb (compare X axis)
+        fingers.append(pts[4][0] < pts[3][0])
+        # Index → Pinky (tip above pip joint in Y = finger up)
+        for tip, pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
+            fingers.append(pts[tip][1] < pts[pip][1])
+        return fingers
+
+    def release(self):
+        self._hands.close()
